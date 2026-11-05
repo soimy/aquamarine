@@ -8,6 +8,9 @@ namespace Aquamarine {
         std::vector<SDRMFormat>                                       formats;
         bool                                                          reprobe = false;
         std::vector<Hyprutils::Memory::CSharedPointer<SDRMConnector>> heads;
+        bool                                                          copyScanout = false;
+        std::vector<Hyprutils::Memory::CSharedPointer<CSwapchain>>    scanoutSwapchains;
+        Hyprutils::Memory::CWeakPointer<IBuffer>                      copiedSource;
         bool                                                          poweredOff = false;
         size_t                                                        activeMode = 0;
         CDRMTileFrame                                                 frame;

@@ -1,6 +1,7 @@
 #include "DRMTileGroup.hpp"
 #include <utility>
 #include "Shared.hpp"
+#include "Renderer.hpp"
 #include <aquamarine/backend/drm/Atomic.hpp>
 #include <aquamarine/backend/Session.hpp>
 #include <aquamarine/allocator/DRMDumb.hpp>
@@ -130,6 +131,11 @@ void CDRMBackend::configureTiledOutputs() {
             continue;
         }
         output->tiled->heads = heads;
+        output->tiled->copyScanout = envEnabled("AQ_DRM_TILED_COPY");
+        if (output->tiled->copyScanout) {
+            output->tiled->scanoutSwapchains.resize(heads.size());
+            log(AQ_LOG_DEBUG, "drm: tiled output uses independent zero-offset scanout buffers (experimental)");
+        }
         // Member CRTCs stay reserved for the lifetime of this group.
         output->tiled->formats = std::move(formats);
         output->tiled->plan    = std::move(*plan);
@@ -248,7 +254,8 @@ bool CDRMOutput::commitTiled(bool onlyTest) {
     // DPMS preserves the native routing, modelines and framebuffer pins.
     // Detaching the connectors would turn a power transition into hotplug on
     // tiled panels whose second link is powered by the first.
-    const bool sameBuffer  = pending.buffer && connector->crtc->primary->front && connector->crtc->primary->front->buffer == pending.buffer;
+    const bool sameBuffer = pending.buffer &&
+        (group->copyScanout ? group->copiedSource == pending.buffer : connector->crtc->primary->front && connector->crtc->primary->front->buffer == pending.buffer);
     const auto powerCommit = COutputState::AQ_OUTPUT_STATE_ENABLED | COutputState::AQ_OUTPUT_STATE_BUFFER | COutputState::AQ_OUTPUT_STATE_DAMAGE |
         COutputState::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE | COutputState::AQ_OUTPUT_STATE_EXPLICIT_OUT_FENCE;
     // An ACTIVE-only request cannot restore state changed by another DRM
@@ -278,6 +285,52 @@ bool CDRMOutput::commitTiled(bool onlyTest) {
         }
         return true;
     }
+    std::vector<SP<CDRMFB>>     scanoutFBs(group->heads.size(), fb);
+    std::vector<SP<CSwapchain>> acquiredScanouts;
+    CScopeGuard                 rewindScanouts([&] {
+        for (const auto& chain : acquiredScanouts)
+            chain->rollback();
+    });
+    if (group->copyScanout && pending.enabled) {
+        if ((!backend->rendererState.renderer || !backend->rendererState.allocator) && !backend->initMgpu())
+            return false;
+        for (size_t i = 0; i < group->heads.size(); ++i) {
+            const auto& rect  = group->plan.placements[i];
+            auto&       chain = group->scanoutSwapchains[i];
+            if (!chain) {
+                chain = CSwapchain::create(backend->rendererState.allocator, backend.lock());
+                // Prime the output's shared format intersection before allocation.
+                if (!chain->reconfigure({.length = 0, .scanout = true, .scanoutOutput = self}))
+                    return false;
+            }
+            if (!chain->reconfigure(
+                    {.length = 3, .size = {double(rect.width), double(rect.height)}, .format = fb->buffer->dmabuf().format, .scanout = true, .scanoutOutput = self}))
+                return false;
+            auto target = chain->next(nullptr);
+            if (!target)
+                return false;
+            acquiredScanouts.push_back(chain);
+            // A modeset can bypass the frame barrier, but must never overwrite a
+            // buffer still used by scanout or deferred device retirement.
+            if (target->lockedByBackend || target->backendRetirementPending())
+                return false;
+            const auto attrs  = target->dmabuf();
+            const auto format = std::ranges::find(group->formats, attrs.format, &SDRMFormat::drmFormat);
+            if (!attrs.success || format == group->formats.end() || std::ranges::find(format->modifiers, attrs.modifier) == format->modifiers.end())
+                return false;
+            scanoutFBs[i] = CDRMFB::create(target, backend, nullptr);
+            if (!scanoutFBs[i] || scanoutFBs[i]->dead)
+                return false;
+            // TEST_ONLY checks the actual destination buffers without touching
+            // their contents. Failed/test commits rewind both swapchains.
+            if (!onlyTest &&
+                !backend->rendererState.renderer->blit(fb->buffer.lock(), target, nullptr, -1, CBox{double(rect.x), double(rect.y), double(rect.width), double(rect.height)})
+                     .success) {
+                backend->log(AQ_LOG_ERROR, "drm: tiled source copy failed");
+                return false;
+            }
+        }
+    }
     const bool wantsFlip = !onlyTest && !group->recovering && pending.enabled && fb && (pending.committed & COutputState::AQ_OUTPUT_STATE_BUFFER);
     uint32_t   flags     = onlyTest ? DRM_MODE_ATOMIC_TEST_ONLY : wantsFlip ? DRM_MODE_PAGE_FLIP_EVENT : 0;
     if (modeset)
@@ -288,7 +341,7 @@ bool CDRMOutput::commitTiled(bool onlyTest) {
     for (size_t i = 0; i < group->heads.size(); ++i) {
         SDRMConnectorCommitData data{};
         data.outputState = pending;
-        data.mainFB      = fb;
+        data.mainFB      = scanoutFBs[i];
         data.enabled     = pending.enabled;
         data.modeset     = modeset;
         data.blocking    = modeset || !wantsFlip;
@@ -299,6 +352,8 @@ bool CDRMOutput::commitTiled(bool onlyTest) {
         data.outputState.committed = data.committed;
         data.modeInfo              = group->plan.modes[modeIndex].heads[i];
         data.primarySource         = group->heads[i]->tiledSource;
+        if (group->copyScanout)
+            data.primarySource = CBox{0, 0, double(data.modeInfo.hdisplay), double(data.modeInfo.vdisplay)};
         if (modeset)
             data.ctm = Mat3x3::identity();
         commits.emplace_back(group->heads[i], std::move(data));
@@ -331,6 +386,9 @@ bool CDRMOutput::commitTiled(bool onlyTest) {
     }
     if (!ok || onlyTest)
         return ok;
+    acquiredScanouts.clear();
+    if (group->copyScanout && fb)
+        group->copiedSource = fb->buffer;
     if (!wantsFlip)
         invalidateTiledFrame();
     DRMFBList retired;
@@ -398,7 +456,7 @@ void CDRMOutput::tiledPageFlip(uintptr_t token, uint32_t crtc, unsigned seq, uns
         .when      = &group->referenceTime,
         .seq       = group->referenceSeq,
         .refresh   = int(connector->refresh ? 1000000000000LL / connector->refresh : 0),
-        .flags     = AQ_OUTPUT_PRESENT_HW_CLOCK | AQ_OUTPUT_PRESENT_HW_COMPLETION | AQ_OUTPUT_PRESENT_VSYNC | AQ_OUTPUT_PRESENT_ZEROCOPY,
+        .flags     = AQ_OUTPUT_PRESENT_HW_CLOCK | AQ_OUTPUT_PRESENT_HW_COMPLETION | AQ_OUTPUT_PRESENT_VSYNC | (group->copyScanout ? 0U : uint32_t(AQ_OUTPUT_PRESENT_ZEROCOPY)),
     });
     if (usable() && backend->sessionActive() && enabledState && !connector->sched.frameScheduled())
         connector->sched.frameReady.emit();

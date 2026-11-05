@@ -1,4 +1,5 @@
 #include "Renderer.hpp"
+#include "Blit.hpp"
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <algorithm>
@@ -933,18 +934,19 @@ void CDRMRenderer::clearBuffer(IBuffer* buf) {
     proc.eglDestroyImageKHR(egl.display, rboImage);
 }
 
-CDRMRenderer::SBlitResult CDRMRenderer::blit(SP<IBuffer> from, SP<IBuffer> to, SP<CDRMRenderer> primaryRenderer, int waitFD) {
+CDRMRenderer::SBlitResult CDRMRenderer::blit(SP<IBuffer> from, SP<IBuffer> to, SP<CDRMRenderer> primaryRenderer, int waitFD, std::optional<CBox> source) {
     if (!from || !to) {
         backend->log(AQ_LOG_ERROR, "EGL (blit): null source or destination buffer");
         return {};
     }
 
-    CEglContextGuard eglContext(*this);
-
-    if (from->dmabuf().size != to->dmabuf().size) {
-        backend->log(AQ_LOG_ERROR, "EGL (blit): buffer sizes mismatched");
+    const auto coordinates = blitTextureCoordinates(from->dmabuf().size, to->dmabuf().size, source);
+    if (!coordinates) {
+        backend->log(AQ_LOG_ERROR, "EGL (blit): invalid source rectangle or buffer sizes");
         return {};
     }
+
+    CEglContextGuard eglContext(*this);
 
     if (waitFD >= 0 && !CFileDescriptor::isReadable(waitFD)) {
         // wait on a provided explicit fence
@@ -989,6 +991,11 @@ CDRMRenderer::SBlitResult CDRMRenderer::blit(SP<IBuffer> from, SP<IBuffer> to, S
             // Note: this might modify from's output attachment
             primaryRenderer->readBuffer(from, intermediateBuf);
         }
+    }
+
+    if (!fromTex || (!fromTex->image && intermediateBuf.empty())) {
+        backend->log(AQ_LOG_ERROR, "EGL (blit): source buffer import failed");
+        return {};
     }
 
     TRACE(backend->log(AQ_LOG_TRACE,
@@ -1095,6 +1102,10 @@ CDRMRenderer::SBlitResult CDRMRenderer::blit(SP<IBuffer> from, SP<IBuffer> to, S
 
     GLCALL(glUniform1i(SHADER.tex, 0));
     GLCALL(glBindVertexArray(SHADER.shaderVao));
+    // Always reset the coordinates, including ordinary full-buffer blits.
+    GLCALL(glBindBuffer(GL_ARRAY_BUFFER, SHADER.shaderVboUv));
+    GLCALL(glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(*coordinates), coordinates->data()));
+    GLCALL(glBindBuffer(GL_ARRAY_BUFFER, 0));
 
     GLCALL(glDrawArrays(GL_TRIANGLE_STRIP, 0, 4));
 
@@ -1104,7 +1115,14 @@ CDRMRenderer::SBlitResult CDRMRenderer::blit(SP<IBuffer> from, SP<IBuffer> to, S
     // get an explicit sync fd for the secondary gpu.
     // when we pass buffers between gpus we should always use explicit sync,
     // as implicit is not guaranteed at all
-    int explicitFD = recreateBlitSync();
+    // The experimental tile-copy path completes each copy before either CRTC
+    // can scan it out. No implicit fence or cross-context lifetime is assumed.
+    // Keep the existing asynchronous fence path for ordinary/multi-GPU blits.
+    int explicitFD = -1;
+    if (source)
+        glFinish();
+    else
+        explicitFD = recreateBlitSync();
 
     GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
     GLCALL(glBindRenderbuffer(GL_RENDERBUFFER, 0));

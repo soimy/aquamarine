@@ -2570,6 +2570,13 @@ void Aquamarine::CDRMOutput::detach() {
     }
     mgpu.swapchain.reset();
     mgpu.cursorSwapchain.reset();
+    if (tiled) {
+        for (const auto& chain : tiled->scanoutSwapchains) {
+            if (chain)
+                chain->shutdown();
+        }
+        tiled->copiedSource.reset();
+    }
     tiled.reset();
     connector.reset();
 }

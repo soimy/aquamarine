@@ -6,6 +6,8 @@ Unless specified otherwise, a variable is enabled if and only if it's set to `1`
 
 `AQ_DRM_DEVICES` -> Set an explicit list of DRM devices (GPUs) to use. It's a colon-separated list of paths, with the first being the primary. E.g. `/dev/dri/card1:/dev/dri/card0`
 `AQ_DRM_TILED_OUTPUTS` -> Opt into experimental native tiled outputs on the atomic DRM backend. See [tiled outputs](tiled-outputs.md) for supported topology and limitations.
+
+`AQ_DRM_TILED_COPY` -> With native tiled outputs enabled, copy each tile into its own scanout buffer at source offset zero. Experimental workaround for drivers that cannot scan a nonzero horizontal offset from a shared buffer. Copies currently complete synchronously on the GPU.
 `AQ_NO_ATOMIC` -> Disables drm atomic modesetting
 `AQ_MGPU_NO_EXPLICIT` -> Disables explicit syncing on mgpu buffers
 `AQ_NO_MODIFIERS` -> Disables modifiers for DRM buffers

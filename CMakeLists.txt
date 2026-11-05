@@ -180,6 +180,12 @@ target_link_libraries(drmTileFrame PRIVATE PkgConfig::deps aquamarine)
 add_test(NAME drmTileFrame COMMAND drmTileFrame)
 add_dependencies(tests drmTileFrame)
 
+add_executable(blit "tests/Blit.cpp")
+target_include_directories(blit PRIVATE "./src/include")
+target_link_libraries(blit PRIVATE PkgConfig::deps)
+add_test(NAME blit COMMAND blit)
+add_dependencies(tests blit)
+
 add_executable(drmShutdown "tests/DRMShutdown.cpp")
 target_include_directories(drmShutdown PRIVATE "./src/backend/drm" "./src/include")
 target_link_libraries(drmShutdown PRIVATE PkgConfig::deps aquamarine)
